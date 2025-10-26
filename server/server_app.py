@@ -1,21 +1,19 @@
-
 import os
-# FastAPI основной объект сервера / File, UploadFile — для обработки файлов, пришедших через POST
+import time
+from io import BytesIO
+
 from fastapi import FastAPI, File, UploadFile
-# JSONResponse — способ возвращать JSON
 from fastapi.responses import JSONResponse
-# uvicorn — сервер для запуска FastAPI
 import uvicorn
-#torch, nn — PyTorch для модели
+
 import torch
 import torch.nn as nn
-# transforms — предобработка изображений
 from torchvision import transforms
-# PIL.Image — загрузка и конвертация изображений в RGB
 from PIL import Image
 
-
-# Хз списал с гпт попозже разберусь
+# ------------------------------
+# Conv Autoencoder (должен совпадать с train.py)
+# ------------------------------
 class ConvAutoencoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -45,112 +43,104 @@ class ConvAutoencoder(nn.Module):
         out = self.dec(z)
         return out
 
+# ------------------------------
+# App init and config
+# ------------------------------
+app = FastAPI(title="VisionQC Server")
 
-# Инициализация FastAPI
-app = FastAPI()
-
-# MODEL_PATH — путь к обученной модели
 MODEL_PATH = 'server/model/model.pth'
-# THRESHOLD_PATH — путь к файлу порога
 THRESHOLD_PATH = 'server/model/threshold.txt'
-# IMG_SIZE — размер, к которому ресайзятся изображения (должен совпадать с тренировкой)
 IMG_SIZE = 128
-# DEVICE — выбираем GPU
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# model.eval() — переводим модель в режим инференса
-model = ConvAutoencoder().to(DEVICE)
-model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-model.eval()
+# ensure folders exist
+os.makedirs('server/model', exist_ok=True)
+os.makedirs('server/logs', exist_ok=True)
 
-# Короче момент какой, сейчас распишу поподробнее, наша модель учится на фото из train, и сравнивает их с фото из val
-# Для чего это надо, у нас и там, и там, фотографии с качественным продуктом, не дефектным, но фото то отличаются
-# И модель сверяя их определяет параметр threshold - параметр разброса, больше которого модель будет считать что на фото анамалия (тоесть дефект)
-# Этот параметр она сохраняет в файл, и мы его берем
-with open(THRESHOLD_PATH, 'r') as f:
-    threshold = float(f.read())
+# demo / real mode selection
+demo_mode = True
+model = None
+threshold = None
 
-'''
-transforms.Compose([...]) — создаёт цепочку преобразований, которые будут применяться последовательно к изображению.
-transforms.Resize((IMG_SIZE, IMG_SIZE))
-    Меняет размер изображения на 128x128 пикселей (значение IMG_SIZE = 128, как у нас).
-    Модель была обучена на картинках именно этого размера.
-    Если не сделать ресайз, PyTorch выдаст ошибку о несоответствии размера входа.
+if os.path.exists(MODEL_PATH) and os.path.exists(THRESHOLD_PATH):
+    try:
+        model = ConvAutoencoder().to(DEVICE)
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
+        model.eval()
+        with open(THRESHOLD_PATH, 'r') as f:
+            threshold = float(f.read().strip())
+        demo_mode = False
+        print(f"[server] Loaded model from {MODEL_PATH}, threshold={threshold:.6g}. Device={DEVICE}")
+    except Exception as e:
+        demo_mode = True
+        print(f"[server] Failed to load model/threshold (falling back to demo mode): {e}")
+else:
+    print("[server] model.pth or threshold.txt not found -> DEMO MODE. Incoming images will be saved to server/logs/")
 
-transforms.ToTensor()
-    Конвертирует PIL Image или NumPy массив в PyTorch тензор.
-    Результат — тензор с форматом [C, H, W]:
-    C = каналы (3 для RGB)
-    H = высота
-    W = ширина
-
-Автоматически нормализует пиксели к диапазону [0.0, 1.0] (раньше пиксели были 0–255).
-'''
+# ------------------------------
+# Preprocessing
+# ------------------------------
 transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
 ])
 
-'''
-img = Image.open(file).convert('RGB')
-    file — это объект UploadFile из FastAPI. Его можно передать PIL напрямую.
-    Image.open(file) — открываем файл как изображение.
-    .convert('RGB') — превращает изображение в RGB (3 канала).
-    PNG может быть с альфа-каналом (4 канала)
-    JPEG может быть grayscale (1 канал)
-    Модель ожидает 3 канала, поэтому конвертируем.
-
-img = transform(img)
-    Применяем цепочку трансформаций, которую описали выше:
-    Resize → 128x128
-    ToTensor → тензор [3,128,128] с диапазоном [0,1] - > 128 это пока затычка, потом возьму данные своей камеры
-
-img = img.unsqueeze(0).to(DEVICE)
-    unsqueeze(0) — добавляем batch dimension.
-    PyTorch модели всегда ожидают тензор с батчем [batch_size, channels, H, W].
-    Мы анализируем одно изображение → делаем [1, 3, 128, 128].
-    .to(DEVICE) — переносим тензор на CPU или GPU, в зависимости от доступности CUDA.
-
-return img
-    Возвращаем тензор, готовый для подачи в модель на inference.
-    Формат: [1,3,128,128], тип torch.float32, значения пикселей в [0,1].
-
-
-
-
-'''
-def preprocess_image(file) -> torch.Tensor:
-    img = Image.open(file).convert('RGB')
-    img = transform(img)
-    img = img.unsqueeze(0).to(DEVICE)  # batch dimension
+def preprocess_image(file_like) -> torch.Tensor:
+    """file_like: file object or BytesIO"""
+    img = Image.open(file_like).convert('RGB')
+    img = transform(img)  # [C,H,W], float32, 0..1
+    img = img.unsqueeze(0).to(DEVICE)  # [1,C,H,W]
     return img
 
-# Честно хз че это, сложно
-def compute_score(img_tensor):
+def compute_score(img_tensor: torch.Tensor) -> float:
     with torch.no_grad():
         recon = model(img_tensor)
         mse = nn.functional.mse_loss(recon, img_tensor, reduction='mean').item()
     return mse
 
-
-# Эндпоинт /analyze
+# ------------------------------
+# Endpoint
+# ------------------------------
 @app.post('/analyze')
-
-# async def analyze_image(image: UploadFile = File(...)):
-# async позволяет обрабатывать несколько запросов одновременно (асинхронно).
-# image: UploadFile = File(...) — FastAPI автоматически парсит файл из запроса multipart/form-data.
 async def analyze_image(image: UploadFile = File(...)):
+    """
+    Accepts multipart/form-data with field 'image'.
+    In demo mode: saves the incoming file to server/logs/ and returns acknowledgment.
+    In real mode: runs preprocess -> model -> compute_score and returns {'result','score'}.
+    """
     try:
-        img_tensor = preprocess_image(image.file) # Вызываем функцию, о которой говорили ранее
-        score = compute_score(img_tensor) # Хз
+        # read all bytes
+        raw = await image.read()
+        # save incoming file for debugging
+        ts = int(time.time())
+        safe_name = f"recv_{ts}.jpg"
+        saved_path = os.path.join('server', 'logs', safe_name)
+        with open(saved_path, 'wb') as wf:
+            wf.write(raw)
+
+        if demo_mode:
+            return JSONResponse(content={'result': 'Received', 'note': 'demo-mode', 'saved': saved_path})
+
+        # real inference
+        buf = BytesIO(raw)
+        img_tensor = preprocess_image(buf)
+        score = compute_score(img_tensor)
         result = 'Good' if score <= threshold else 'Bad'
-        return JSONResponse(content={'result': result, 'score': score})
+        return JSONResponse(content={'result': result, 'score': score, 'saved': saved_path})
     except Exception as e:
         return JSONResponse(content={'error': str(e)}, status_code=500)
 
-# Запуск сервера
+# ------------------------------
+# Health/check endpoint (optional)
+# ------------------------------
+@app.get('/health')
+def health():
+    return {'status': 'ok', 'mode': 'demo' if demo_mode else 'real', 'device': str(DEVICE)}
+
+# ------------------------------
+# Run server
 # ------------------------------
 if __name__ == '__main__':
+    # uvicorn will print logs and serve OpenAPI at /docs
+    print("[server] Starting uvicorn on 0.0.0.0:8000 ...")
     uvicorn.run(app, host='0.0.0.0', port=8000)
-
-    
